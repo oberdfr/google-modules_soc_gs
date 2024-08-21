@@ -476,6 +476,7 @@ static void xhci_exynos_pm_runtime_init(struct device *dev)
 	init_waitqueue_head(&dev->power.wait_queue);
 }
 
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 static struct xhci_exynos_ops *xhci_vendor_ops;
 
 int xhci_exynos_register_offload_ops(struct xhci_exynos_ops *offload_ops)
@@ -520,6 +521,43 @@ static int xhci_vendor_offload_setup(struct device *dev, struct xhci_hcd *xhci)
 	dev_err(dev, "Offload hooks or setup function is null!\n");
 	return -EINVAL;
 }
+#else
+static struct xhci_plat_priv_overwrite xhci_plat_vendor_overwrite;
+
+int xhci_exynos_register_vendor_ops(struct xhci_vendor_ops *vendor_ops)
+{
+	if (vendor_ops == NULL)
+		return -EINVAL;
+
+	xhci_plat_vendor_overwrite.vendor_ops = vendor_ops;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(xhci_exynos_register_vendor_ops);
+
+static int xhci_vendor_init(struct xhci_hcd *xhci)
+{
+	struct xhci_vendor_ops *ops = NULL;
+
+	if (xhci_plat_vendor_overwrite.vendor_ops)
+		ops = xhci->vendor_ops = xhci_plat_vendor_overwrite.vendor_ops;
+
+	if (ops && ops->vendor_init)
+		return ops->vendor_init(xhci);
+
+	return 0;
+}
+
+static void xhci_vendor_cleanup(struct xhci_hcd *xhci)
+{
+	struct xhci_vendor_ops *ops = xhci_vendor_get_ops(xhci);
+
+	if (ops && ops->vendor_cleanup)
+		ops->vendor_cleanup(xhci);
+
+	xhci->vendor_ops = NULL;
+}
+#endif
 
 static int xhci_exynos_probe(struct platform_device *pdev)
 {
@@ -705,7 +743,11 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 		}
 	}
 
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 	ret = xhci_vendor_offload_init(&pdev->dev, xhci);
+#else
+	ret = xhci_vendor_init(xhci);
+#endif
 	if (ret)
 		goto disable_usb_phy;
 
@@ -728,9 +770,11 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 	xhci_exynos_early_stop_set(xhci_exynos, hcd);
 	xhci_exynos_early_stop_set(xhci_exynos, xhci->shared_hcd);
 
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 	ret = xhci_vendor_offload_setup(&pdev->dev, xhci);
 	if (ret)
 		goto disable_usb_phy;
+#endif
 
 	device_enable_async_suspend(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
@@ -809,7 +853,11 @@ remove_hcd:
 	usb_phy_shutdown(hcd->usb_phy);
 	usb_remove_hcd(hcd);
 
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 	xhci_vendor_offload_cleanup(&dev->dev, xhci);
+#else
+	xhci_vendor_cleanup(xhci);
+#endif
 
 	devm_iounmap(&dev->dev, hcd->regs);
 	usb_put_hcd(shared_hcd);
