@@ -240,6 +240,7 @@ struct exynos_pcie {
 	struct s2mpu_info	*s2mpu;
 	struct pci_dev		*ep_pci_dev;
 	void __iomem		*elbi_base;
+	void __iomem		*soc_base;
 	void __iomem		*udbg_base;
 	void __iomem		*phy_base;
 	void __iomem		*sysreg_base;
@@ -271,6 +272,7 @@ struct exynos_pcie {
 	int			idle_ip_index;
 	int			separated_msi;
 	bool			use_msi;
+	bool			support_msi64_addressing;
 	bool			use_cache_coherency;
 	bool			use_sicd;
 	bool			use_pcieon_sleep;
@@ -310,15 +312,18 @@ struct exynos_pcie {
 	int			work_l1ss_cnt;
 	int			ep_device_type;
 	int			max_link_speed;
+	int			perst_delay_us;
 	struct power_stats	link_up;
 	struct power_stats	link_down;
 	struct link_stats	link_stats;
+	bool l1ss_force;
+	bool l11_enable;
+	bool l12_enable;
 
 	struct pinctrl		*pcie_pinctrl;
 	struct pinctrl_state	*pin_state[MAX_PCIE_PIN_STATE];
 	struct pcie_eom_result **eom_result;
 	struct notifier_block	itmon_nb;
-	struct notifier_block   panic_nb;
 
 	int wlan_gpio;
 	int ssd_gpio;
@@ -334,6 +339,9 @@ struct exynos_pcie {
 	u32 btl_offset;
 	u32 btl_size;
 
+	struct device dup_ep_dev;
+	int copy_dup_ep;
+
 	bool use_phy_isol_con;
 	int phy_control;
 	struct logbuffer *log;
@@ -342,6 +350,7 @@ struct exynos_pcie {
 	int pcieon_sleep_enable_cnt;
 
 	struct mutex power_onoff_lock;
+	bool skip_config;
 };
 
 #define PCIE_MAX_MSI_NUM	(8)
@@ -373,12 +382,14 @@ static inline void exynos_##base##_write(struct exynos_pcie *pcie, type value, t
 }
 
 PCIE_EXYNOS_OP_READ(elbi, u32);
+PCIE_EXYNOS_OP_READ(soc, u32);
 PCIE_EXYNOS_OP_READ(udbg, u32);
 PCIE_EXYNOS_OP_READ(phy, u32);
 PCIE_EXYNOS_OP_READ(phy_pcs, u32);
 PCIE_EXYNOS_OP_READ(sysreg, u32);
 PCIE_EXYNOS_OP_READ(ia, u32);
 PCIE_EXYNOS_OP_WRITE(elbi, u32);
+PCIE_EXYNOS_OP_WRITE(soc, u32);
 PCIE_EXYNOS_OP_WRITE(udbg, u32);
 PCIE_EXYNOS_OP_WRITE(phy, u32);
 PCIE_EXYNOS_OP_WRITE(phy_pcs, u32);
