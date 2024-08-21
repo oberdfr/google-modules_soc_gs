@@ -8,6 +8,13 @@ config ARM_MEMLAT_MON
 	  This driver uses these counters to implement the APIs needed by
 	  the mem_latency devfreq governor.
 
+config DEVFREQ_GOV_DSU
+	  tristate "ARM EXYNOS DEVFREQ DSU Common driver"
+	  depends on ARM_EXYNOS_DEVFREQ || CONFIG_DEVFREQ_GOV_MEMLAT
+	  default y if SOC_ZUMA
+	  help
+		This adds the DEVFREQ DSU driver for Exynos series common bus
+
 config DEVFREQ_GOV_MEMLAT
 	tristate "HW monitor based governor for device BW"
 	depends on ARM_MEMLAT_MON

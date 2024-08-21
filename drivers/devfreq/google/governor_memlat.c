@@ -22,7 +22,11 @@
 #include <linux/of.h>
 #include <linux/devfreq.h>
 #include <soc/google/exynos_pm_qos.h>
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 #include <dt-bindings/soc/google/zuma-devfreq.h>
+#else
+#include <dt-bindings/soc/google/gs101-devfreq.h>
+#endif
 #include <trace/events/power.h>
 #include "governor.h"
 #include "governor_memlat.h"

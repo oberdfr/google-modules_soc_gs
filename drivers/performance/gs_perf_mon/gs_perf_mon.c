@@ -666,8 +666,7 @@ static int initialize_cpu_data_info(struct device *dev, struct device_node *cpu_
 	amu_node = of_get_child_by_name(cpu_node, "amu_events");
 	ret = parse_perf_counters(dev, amu_node, cpu_event_data, AMU);
 	if (ret) {
-		dev_err(dev, "Couldn't parse amu_node, skipping performance monitoring.\n");
-		return ret;
+		dev_info(dev, "Couldn't parse amu_node. Skipping..\n");
 	}
 
 	return ret;

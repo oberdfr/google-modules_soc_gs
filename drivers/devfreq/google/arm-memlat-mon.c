@@ -31,7 +31,11 @@
 #include <linux/mutex.h>
 #include <trace/hooks/cpuidle.h>
 #include <linux/spinlock.h>
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 #include <dt-bindings/soc/google/zuma-devfreq.h>
+#else
+#include <dt-bindings/soc/google/gs101-devfreq.h>
+#endif
 
 static struct exynos_devfreq_data *dsu_data;
 
