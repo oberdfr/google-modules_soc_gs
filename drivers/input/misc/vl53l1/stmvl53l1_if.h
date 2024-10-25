@@ -36,7 +36,12 @@
  * @li stmvl53l1_ranging1
  * @li stmvl53l1_ranging2
  */
+#if IS_ENABLED(CONFIG_SOC_ZUMA)
 #define VL53L1_MISC_DEV_NAME "ispolin_ranging"
+#else
+#define VL53L1_MISC_DEV_NAME "stmvl53l1_ranging"
+#endif
+
 /**
  * register data use for simple/single ranging data @ref VL53L1_IOCTL_GETDATAS
  *
