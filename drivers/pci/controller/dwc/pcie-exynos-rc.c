@@ -411,15 +411,15 @@ void exynos_pcie_set_perst_gpio(int ch_num, bool on)
 	struct exynos_pcie *exynos_pcie = &g_pcie_rc[ch_num];
 
 	if (exynos_pcie->ep_device_type == EP_SAMSUNG_MODEM) {
-		pr_info("%s: force settig for abnormal state\n", __func__);
+		pr_debug("%s: force setting for abnormal state\n", __func__);
 		if (on) {
 			gpio_set_value(exynos_pcie->perst_gpio, 1);
-			pr_info("%s: Set PERST to HIGH, gpio val = %d\n",
-				__func__, gpio_get_value(exynos_pcie->perst_gpio));
+			pr_debug("%s: Set PERST to HIGH, gpio val = %d\n",
+				 __func__, gpio_get_value(exynos_pcie->perst_gpio));
 		} else {
 			gpio_set_value(exynos_pcie->perst_gpio, 0);
-			pr_info("%s: Set PERST to LOW, gpio val = %d\n",
-				__func__, gpio_get_value(exynos_pcie->perst_gpio));
+			pr_debug("%s: Set PERST to LOW, gpio val = %d\n",
+				 __func__, gpio_get_value(exynos_pcie->perst_gpio));
 		}
 	}
 }
@@ -3711,7 +3711,7 @@ retry:
 				__func__, try_cnt);
 			if (try_cnt < 10) {
 				gpio_set_value(exynos_pcie->perst_gpio, 0);
-				dev_info(dev, "Set PERST LOW, gpio val = %d\n",
+				dev_dbg(dev, "Set PERST LOW, gpio val = %d\n",
 					gpio_get_value(exynos_pcie->perst_gpio));
 				/* LTSSM disable */
 				exynos_elbi_write(exynos_pcie, PCIE_ELBI_LTSSM_DISABLE,
@@ -3913,6 +3913,10 @@ int exynos_pcie_rc_poweron(int ch_num)
 		val = readl(exynos_pcie->phy_pcs_base + 0x150);
 		dev_dbg(dev, "pwron: pcs+0x150: %#x\n", val);
 	}
+
+	if (exynos_pcie->ep_l1ss_cap_off == U32_MAX)
+		WRITE_ONCE(exynos_pcie->ep_l1ss_cap_off,
+			   pci_find_ext_capability(exynos_pcie->ep_pci_dev, PCI_EXT_CAP_ID_L1SS));
 
 	dev_dbg(dev, "end poweron, state: %d\n", exynos_pcie->state);
 	logbuffer_log(exynos_pcie->log, "end poweron, state: %d\n", exynos_pcie->state);
@@ -4252,9 +4256,9 @@ static int exynos_pcie_rc_set_l1ss(int enable, struct dw_pcie_rp *pp, int id)
 			__func__, exynos_pcie->l1ss_ctrl_id_state, id);
 
 		return -1;
+	} else if (READ_ONCE(exynos_pcie->ep_l1ss_cap_off) == U32_MAX) {
+		return -1;
 	} else {
-		exynos_pcie->ep_l1ss_cap_off =
-			pci_find_ext_capability(exynos_pcie->ep_pci_dev, PCI_EXT_CAP_ID_L1SS);
 		exynos_pcie->ep_link_ctrl_off = exynos_pcie->ep_pci_dev->pcie_cap + PCI_EXP_LNKCTL;
 		exynos_pcie->ep_l1ss_ctrl1_off = exynos_pcie->ep_l1ss_cap_off + PCI_L1SS_CTL1;
 		exynos_pcie->ep_l1ss_ctrl2_off = exynos_pcie->ep_l1ss_cap_off + PCI_L1SS_CTL2;
@@ -4944,10 +4948,6 @@ static int exynos_pcie_msi_set_affinity(struct irq_data *irq_data, const struct 
 	if (!exynos_pcie)
 		return -ENODEV;
 
-	/* modem driver sets msi irq affinity */
-	if (exynos_pcie->ch_num == 0)
-		return 0;
-
 	idata = irq_get_irq_data(pp->irq);
 	if (!idata || !idata->chip)
 		return -ENODEV;
@@ -5562,6 +5562,7 @@ static int exynos_pcie_rc_probe(struct platform_device *pdev)
 	pp = &pci->pp;
 	pp->ops = &exynos_pcie_rc_ops;
 
+	exynos_pcie->ep_l1ss_cap_off = U32_MAX;
 	spin_lock_init(&exynos_pcie->pcie_l1_exit_lock);
 	spin_lock_init(&exynos_pcie->conf_lock);
 	spin_lock_init(&exynos_pcie->power_stats_lock);

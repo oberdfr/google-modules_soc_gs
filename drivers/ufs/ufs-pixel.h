@@ -308,12 +308,6 @@ enum pixel_power_event_type {
 	PE_MAX
 };
 
-enum pixel_ufs_wb_gid {
-	WB_GID_DISABLE = 0,
-	WB_GID_SEL = 1,
-	WB_GID_ALL = 2,
-};
-
 /**
  * struct pixel_ufs - Per HBA private data related to Pixel features.
  */
@@ -356,10 +350,6 @@ struct pixel_ufs {
 	/* ufs command logging */
 	u8 enable_cmd_log;
 	struct pixel_cmd_log cmd_log;
-
-	/* enable WriteBooster based on given Group ID mode */
-	enum pixel_ufs_wb_gid set_gid;
-	bool need_wb_flush;
 
 	/* power event tracing with kibble */
 	spinlock_t power_event_lock;

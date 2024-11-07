@@ -746,9 +746,11 @@ static void pixel_ufs_compl_command(void *data, struct ufs_hba *hba,
 	int ocs;
 	struct request *rq;
 
-	pixel_ufs_update_io_stats(hba, lrbp, false);
-	pixel_ufs_update_req_stats(hba, lrbp);
-	pixel_ufs_trace_upiu_cmd(hba, lrbp, false);
+	if (IS_ENABLED(ENABLE_UFS_STATS)) {
+		pixel_ufs_update_io_stats(hba, lrbp, false);
+		pixel_ufs_update_req_stats(hba, lrbp);
+		pixel_ufs_trace_upiu_cmd(hba, lrbp, false);
+	}
 
 	if (!lrbp->cmd)
 		return;
@@ -800,42 +802,6 @@ static void pixel_ufs_compl_command(void *data, struct ufs_hba *hba,
 		sense_buffer[0] = 0x71;
 		*(sense_buffer + 12) = 0;
 	}
-}
-
-static void pixel_ufs_prepare_command(void *data, struct ufs_hba *hba,
-			struct request *rq, struct ufshcd_lrb *lrbp, int *err)
-{
-	struct pixel_ufs *ufs = to_pixel_ufs(hba);
-	u8 opcode;
-
-	*err = 0;
-
-	if (ufs->set_gid == WB_GID_DISABLE)
-		return;
-
-	/*
-	 * Set the group number to 0x11, if set_gid is,
-	 *  1: WB_GID_SEL for REQ_META and REQ_IDLE requests,
-	 *  2: WB_GID_ALL for all the requests.
-	 */
-	if (ufs->set_gid == WB_GID_SEL &&
-	   !(rq->cmd_flags & (REQ_META | REQ_IDLE)))
-		return;
-
-	/* Do not set the group number for zoned logical units. */
-	if (blk_queue_is_zoned(rq->q))
-		return;
-
-	/* Only set the group number for UFS versions 3.1 and later. */
-	if (hba->dev_info.wspecversion <= 0x300)
-		return;
-
-	opcode = (u8)(*lrbp->cmd->cmnd);
-	if (opcode == WRITE_10)
-		lrbp->cmd->cmnd[6] = 0x11;
-	else if (opcode == WRITE_16)
-		lrbp->cmd->cmnd[14] = 0x11;
-	ufs->need_wb_flush = true;
 }
 
 static ssize_t life_time_estimation_c_show(struct device *dev,
@@ -978,22 +944,6 @@ static ssize_t manual_gc_store(struct device *dev,
 			manual_gc_enable(hba, &value) ? false : true;
 
 	pm_runtime_get_sync(hba->dev);
-
-	/* flush wb buffer */
-	if (hba->dev_info.wspecversion >= 0x0310) {
-		enum query_opcode opcode = (value == MANUAL_GC_ON) ?
-						UPIU_QUERY_OPCODE_SET_FLAG:
-						UPIU_QUERY_OPCODE_CLEAR_FLAG;
-		u8 index = ufshcd_wb_get_query_index(hba);
-
-		if (ufs->need_wb_flush) {
-			ufshcd_query_flag_retry(hba, opcode,
-				QUERY_FLAG_IDN_WB_BUFF_FLUSH_DURING_HIBERN8,
-				index, NULL);
-			ufshcd_query_flag_retry(hba, opcode,
-				QUERY_FLAG_IDN_WB_BUFF_FLUSH_EN, index, NULL);
-		}
-	}
 
 	if (!ufs->manual_gc.hagc_support) {
 		err = ufshcd_bkops_ctrl(hba, (value == MANUAL_GC_ON) ?
@@ -1173,49 +1123,6 @@ static ssize_t uic_link_state_show(struct device *dev,
 				hba->uic_link_state));
 }
 
-static const char * const wb_gid_str[] = {
-	[WB_GID_DISABLE]	= "disable",
-	[WB_GID_SEL]		= "selective",
-	[WB_GID_ALL]		= "all",
-};
-
-static ssize_t set_gid_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-	struct pixel_ufs *ufs = to_pixel_ufs(hba);
-
-	return snprintf(buf, PAGE_SIZE, "%s\n", wb_gid_str[ufs->set_gid]);
-}
-
-static ssize_t set_gid_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-	struct pixel_ufs *ufs = to_pixel_ufs(hba);
-	enum query_opcode opcode;
-	int i;
-	u8 index;
-
-	i = sysfs_match_string(wb_gid_str, buf);
-	if (i < 0)
-		return i;
-
-	if (i == ufs->set_gid)
-		return count;
-
-	/* 0: disable, 1: enable selectively, 2: always */
-	opcode = i != WB_GID_DISABLE ? UPIU_QUERY_OPCODE_SET_FLAG :
-			   UPIU_QUERY_OPCODE_CLEAR_FLAG;
-	index = ufshcd_wb_get_query_index(hba);
-	ufshcd_query_flag_retry(hba, opcode,
-				QUERY_FLAG_IDN_WB_BUFF_FLUSH_DURING_HIBERN8,
-				index, NULL);
-	ufs->set_gid = i;
-	return count;
-}
-
 static DEVICE_ATTR_RO(vendor);
 static DEVICE_ATTR_RO(model);
 static DEVICE_ATTR_RO(rev);
@@ -1225,7 +1132,6 @@ static DEVICE_ATTR_RW(manual_gc_hold);
 static DEVICE_ATTR_RO(host_capabilities);
 static DEVICE_ATTR_RO(curr_dev_pwr_mode);
 static DEVICE_ATTR_RO(uic_link_state);
-static DEVICE_ATTR_RW(set_gid);
 SLOWIO_ATTR_RW(read, PIXEL_SLOWIO_READ);
 SLOWIO_ATTR_RW(write, PIXEL_SLOWIO_WRITE);
 SLOWIO_ATTR_RW(unmap, PIXEL_SLOWIO_UNMAP);
@@ -1319,7 +1225,6 @@ static struct attribute *pixel_sysfs_ufshcd_attrs[] = {
 	&dev_attr_host_capabilities.attr,
 	&dev_attr_curr_dev_pwr_mode.attr,
 	&dev_attr_uic_link_state.attr,
-	&dev_attr_set_gid.attr,
 	&ufs_slowio_read_us.attr.attr,
 	&ufs_slowio_read_cnt.attr.attr,
 	&ufs_slowio_write_us.attr.attr,
@@ -2014,7 +1919,7 @@ void pixel_print_cmd_log(struct ufs_hba *hba)
 	struct pixel_cmd_log_entry *entry = NULL;
 	int i;
 
-	if (!ufs->enable_cmd_log)
+	if (!IS_ENABLED(ENABLE_UFS_STATS) || !ufs->enable_cmd_log)
 		return;
 
 	for (i = 1; i <= MAX_CMD_ENTRY_NUM; i++) {
@@ -2036,7 +1941,7 @@ static void pixel_ufs_init(struct pixel_ufs *ufs)
 	memset(&ufs->ufs_stats, 0, sizeof(struct pixel_ufs_stats));
 	memset(&ufs->power_stats, 0, sizeof(struct pixel_power_stats));
 	ufs->ufs_stats.hibern8_flag = false;
-	ufs->set_gid = WB_GID_SEL;
+	INIT_WORK(&ufs->update_sysfs_work, pixel_ufs_update_sysfs_work);
 
 	/* init power event monitoring */
 	spin_lock_init(&ufs->power_event_lock);
@@ -2058,49 +1963,47 @@ int pixel_init(struct ufs_hba *hba, struct device *pdev,
 
 	pixel_ufs_init(ufs);
 
-	ret = register_trace_android_vh_ufs_prepare_command(
-				pixel_ufs_prepare_command, NULL);
-	if (ret)
-		return ret;
-
 	ret = register_trace_android_vh_ufs_update_sysfs(
 				pixel_ufs_update_sysfs, NULL);
 	if (ret)
 		return ret;
 
-	ret = register_trace_android_vh_ufs_send_command(
-				pixel_ufs_send_command, NULL);
-	if (ret)
-		return ret;
+	if (IS_ENABLED(ENABLE_UFS_STATS)) {
+		ret = register_trace_android_vh_ufs_send_command(
+					pixel_ufs_send_command, NULL);
+		if (ret)
+			return ret;
+	}
 
 	ret = register_trace_android_vh_ufs_compl_command(
 				pixel_ufs_compl_command, NULL);
 	if (ret)
 		return ret;
 
-	ret = register_trace_android_vh_ufs_send_uic_command(
-				pixel_ufs_send_uic_command, NULL);
-	if (ret)
-		return ret;
+	if (IS_ENABLED(ENABLE_UFS_STATS)) {
+		ret = register_trace_android_vh_ufs_send_uic_command(
+					pixel_ufs_send_uic_command, NULL);
+		if (ret)
+			return ret;
 
-	ret = register_trace_android_vh_ufs_send_tm_command(
-				pixel_ufs_send_tm_command, NULL);
-	if (ret)
-		return ret;
+		ret = register_trace_android_vh_ufs_send_tm_command(
+					pixel_ufs_send_tm_command, NULL);
+		if (ret)
+			return ret;
 
-	ret = register_trace_android_vh_ufs_check_int_errors(
-				pixel_ufs_check_int_errors, NULL);
-	if (ret)
-		return ret;
+		ret = register_trace_android_vh_ufs_check_int_errors(
+					pixel_ufs_check_int_errors, NULL);
+		if (ret)
+			return ret;
+	}
 
 	ret = register_trace_android_vh_ufs_update_sdev(
 				pixel_ufs_update_sdev, NULL);
 	if (ret)
 		return ret;
 
-	pixel_ufs_init_cmd_log(hba);
-
-	INIT_WORK(&ufs->update_sysfs_work, pixel_ufs_update_sysfs_work);
+	if (IS_ENABLED(ENABLE_UFS_STATS))
+		pixel_ufs_init_cmd_log(hba);
 
 	pixel_init_manual_gc(hba);
 
