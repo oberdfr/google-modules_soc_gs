@@ -572,6 +572,7 @@ static int mfc_release(struct file *file)
 	int ret = 0;
 	int i;
 
+	mutex_lock(&dev->sysmmu_fault_mutex);
 	mutex_lock(&dev->mfc_mutex);
 	mutex_lock(&dev->mfc_migrate_mutex);
 
@@ -665,6 +666,7 @@ end_release:
 		atomic_dec(&subcore->during_release);
 	mutex_unlock(&dev->mfc_migrate_mutex);
 	mutex_unlock(&dev->mfc_mutex);
+	mutex_unlock(&dev->sysmmu_fault_mutex);
 	return ret;
 }
 
@@ -1088,6 +1090,7 @@ static int mfc_probe(struct platform_device *pdev)
 
 	mutex_init(&dev->mfc_mutex);
 	mutex_init(&dev->mfc_migrate_mutex);
+	mutex_init(&dev->sysmmu_fault_mutex);
 
 	ret = v4l2_device_register(&pdev->dev, &dev->v4l2_dev);
 	if (ret)
@@ -1193,6 +1196,7 @@ alloc_vdev_dec:
 err_v4l2_dev:
 	mutex_destroy(&dev->mfc_mutex);
 	mutex_destroy(&dev->mfc_migrate_mutex);
+	mutex_destroy(&dev->sysmmu_fault_mutex);
 err_res_mem:
 	mfc_dev_deinit_memlog(dev);
 	return ret;

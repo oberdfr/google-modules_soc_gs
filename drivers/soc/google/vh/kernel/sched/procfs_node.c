@@ -34,6 +34,7 @@ bool __read_mostly vendor_sched_boost_adpf_prio = true;
 unsigned int __read_mostly vendor_sched_adpf_rampup_multiplier = 1;
 struct cpumask cpu_skip_mask_rt;
 struct cpumask skip_prefer_prev_mask;
+unsigned int __read_mostly vendor_sched_priority_task_boost_value = 0;
 
 static struct proc_dir_entry *vendor_sched;
 struct proc_dir_entry *group_dirs[VG_MAX];
@@ -71,10 +72,13 @@ extern void pmu_poll_disable(void);
 extern unsigned int sysctl_sched_uclamp_min_filter_us;
 extern unsigned int sysctl_sched_uclamp_max_filter_divider;
 
+extern char priority_task_name[LIB_PATH_LENGTH];
+extern spinlock_t priority_task_name_lock;
+
 #define MAX_PROC_SIZE 128
 
 static const char *GRP_NAME[VG_MAX] = {"sys", "ta", "fg", "cam", "cam_power", "bg", "sys_bg",
-				       "nnapi", "rt", "dex2oat", "ota", "sf"};
+				       "nnapi", "rt", "dex2oat", "ota", "sf", "fg_wi"};
 
 enum vendor_procfs_type {
 	DEFAULT_TYPE = 0,
@@ -942,6 +946,46 @@ VENDOR_GROUP_BOOL_ATTRIBUTE(sf, disable_util_est, VG_SF);
 VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(sf, ug, VG_SF, check_ug);
 #endif
 
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, prefer_idle, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, prefer_high_cap, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, task_spreading, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, auto_prefer_fit, VG_FOREGROUND_WINDOW);
+#if !IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, group_throttle, VG_FOREGROUND_WINDOW);
+#endif
+VENDOR_GROUP_CPUMASK_ATTRIBUTE(fg_wi, group_cfs_skip_mask, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_CPUMASK_ATTRIBUTE(fg_wi, preferred_idle_mask_low, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_CPUMASK_ATTRIBUTE(fg_wi, preferred_idle_mask_mid, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_CPUMASK_ATTRIBUTE(fg_wi, preferred_idle_mask_high, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UCLAMP_ATTRIBUTE(fg_wi, uclamp_min, VG_FOREGROUND_WINDOW, UCLAMP_MIN);
+VENDOR_GROUP_UCLAMP_ATTRIBUTE(fg_wi, uclamp_max, VG_FOREGROUND_WINDOW, UCLAMP_MAX);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_min_on_nice_low_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_min_on_nice_mid_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_min_on_nice_high_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_max_on_nice_low_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_max_on_nice_mid_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE(fg_wi, uclamp_max_on_nice_high_value, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_min_on_nice_low_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_min_on_nice_prio);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_min_on_nice_mid_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_min_on_nice_prio);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_min_on_nice_high_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_min_on_nice_prio);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_max_on_nice_low_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_max_on_nice_prio);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_max_on_nice_mid_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_max_on_nice_prio);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, uclamp_max_on_nice_high_prio, VG_FOREGROUND_WINDOW, \
+	check_uclamp_max_on_nice_prio);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, uclamp_min_on_nice_enable, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, uclamp_max_on_nice_enable, VG_FOREGROUND_WINDOW);
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, rampup_multiplier, VG_FOREGROUND_WINDOW, \
+	check_rampup_multiplier);
+VENDOR_GROUP_BOOL_ATTRIBUTE(fg_wi, disable_util_est, VG_FOREGROUND_WINDOW);
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(fg_wi, ug, VG_FOREGROUND_WINDOW, check_ug);
+#endif
+
 #if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
 UTILIZATION_GROUP_UINT_ATTRIBUTE(ug_fg, group_throttle, UG_FG);
@@ -955,45 +999,6 @@ UTILIZATION_GROUP_UINT_ATTRIBUTE(ug_bg, group_throttle, UG_BG);
 UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_bg, uclamp_min, UG_BG, UCLAMP_MIN);
 UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_bg, uclamp_max, UG_BG, UCLAMP_MAX);
 #endif
-
-/// ******************************************************************************** ///
-/// ********************* From upstream code for uclamp **************************** ///
-/// ******************************************************************************** ///
-static inline void
-uclamp_update_active(struct task_struct *p, enum uclamp_id clamp_id)
-{
-	struct rq_flags rf;
-	struct rq *rq;
-
-	if (!uclamp_is_used())
-		return;
-
-	/*
-	 * Lock the task and the rq where the task is (or was) queued.
-	 *
-	 * We might lock the (previous) rq of a !RUNNABLE task, but that's the
-	 * price to pay to safely serialize util_{min,max} updates with
-	 * enqueues, dequeues and migration operations.
-	 * This is the same locking schema used by __set_cpus_allowed_ptr().
-	 */
-	rq = task_rq_lock(p, &rf);
-
-	/*
-	 * Setting the clamp bucket is serialized by task_rq_lock().
-	 * If the task is not yet RUNNABLE and its task_struct is not
-	 * affecting a valid clamp bucket, the next time it's enqueued,
-	 * it will already see the updated clamp bucket value.
-	 */
-	if (p->uclamp[clamp_id].active) {
-		uclamp_rq_dec_id(rq, p, clamp_id);
-		uclamp_rq_inc_id(rq, p, clamp_id);
-
-		if (clamp_id == UCLAMP_MAX && rq->uclamp_flags & UCLAMP_FLAG_IDLE)
-			rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
-	}
-
-	task_rq_unlock(rq, p, &rf);
-}
 
 /// ******************************************************************************** ///
 /// ********************* New code section ***************************************** ///
@@ -1015,12 +1020,12 @@ static inline bool check_cred(struct task_struct *p)
 	return ret;
 }
 
-
-static int update_sched_capacity_margin(const char *buf, int count)
+static int update_vendor_tunables(const char *buf, int count, int type)
 {
 	char *tok, *str1, *str2;
 	unsigned int val, tmp[CONFIG_VH_SCHED_MAX_CPU_NR];
 	int index = 0;
+	unsigned int *updated_tunables;
 
 	str1 = kstrndup(buf, count, GFP_KERNEL);
 	str2 = str1;
@@ -1037,9 +1042,35 @@ static int update_sched_capacity_margin(const char *buf, int count)
 		if (kstrtouint(tok, 0, &val))
 			goto fail;
 
-		if (val < SCHED_CAPACITY_SCALE)
-			goto fail;
-
+		switch (type) {
+			case SCHED_CAPACITY_MARGIN:
+				if (val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_capacity_margin;
+				break;
+			case THERMAL_CAP_MARGIN:
+				if (val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = thermal_cap_margin;
+				break;
+			case SCHED_AUTO_UCLAMP_MAX:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_auto_uclamp_max;
+				break;
+			case SCHED_DVFS_HEADROOM:
+				if (val > DEF_UTIL_THRESHOLD || val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_dvfs_headroom;
+				break;
+			case SCHED_IOWAIT_BOOST_MAX:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_per_cpu_iowait_boost_max_value;
+				break;
+			default:
+				goto fail;
+		}
 		tmp[index] = val;
 		index++;
 
@@ -1049,76 +1080,19 @@ static int update_sched_capacity_margin(const char *buf, int count)
 
 	if (index == 1) {
 		for (index = 0; index < pixel_cpu_num; index++) {
-			sched_capacity_margin[index] = tmp[0];
+			updated_tunables[index] = tmp[0];
 		}
 	} else if (index == pixel_cluster_num) {
 		for (index = pixel_cluster_start_cpu[0]; index < pixel_cluster_start_cpu[1]; index++)
-			sched_capacity_margin[index] = tmp[0];
+			updated_tunables[index] = tmp[0];
 
 		for (index = pixel_cluster_start_cpu[1]; index < pixel_cluster_start_cpu[2]; index++)
-			sched_capacity_margin[index] = tmp[1];
+			updated_tunables[index] = tmp[1];
 
 		for (index = pixel_cluster_start_cpu[2]; index < pixel_cpu_num; index++)
-			sched_capacity_margin[index] = tmp[2];
+			updated_tunables[index] = tmp[2];
 	} else if (index == pixel_cpu_num) {
-		memcpy(sched_capacity_margin, tmp, sizeof(sched_capacity_margin));
-	} else {
-		goto fail;
-	}
-
-	kfree(str1);
-	return count;
-fail:
-	kfree(str1);
-	return -EINVAL;
-}
-
-static int update_sched_dvfs_headroom(const char *buf, int count)
-{
-	char *tok, *str1, *str2;
-	unsigned int val, tmp[CONFIG_VH_SCHED_MAX_CPU_NR];
-	int index = 0;
-
-	str1 = kstrndup(buf, count, GFP_KERNEL);
-	str2 = str1;
-
-	if (!str2)
-		return -ENOMEM;
-
-	while (1) {
-		tok = strsep(&str2, " ");
-
-		if (tok == NULL)
-			break;
-
-		if (kstrtouint(tok, 0, &val))
-			goto fail;
-
-		if (val > DEF_UTIL_THRESHOLD || val < SCHED_CAPACITY_SCALE)
-			goto fail;
-
-		tmp[index] = val;
-		index++;
-
-		if (index == pixel_cpu_num)
-			break;
-	}
-
-	if (index == 1) {
-		for (index = 0; index < pixel_cpu_num; index++) {
-			sched_dvfs_headroom[index] = tmp[0];
-		}
-	} else if (index == pixel_cluster_num) {
-		for (index = pixel_cluster_start_cpu[0]; index < pixel_cluster_start_cpu[1]; index++)
-			sched_dvfs_headroom[index] = tmp[0];
-
-		for (index = pixel_cluster_start_cpu[1]; index < pixel_cluster_start_cpu[2]; index++)
-			sched_dvfs_headroom[index] = tmp[1];
-
-		for (index = pixel_cluster_start_cpu[2]; index < pixel_cpu_num; index++)
-			sched_dvfs_headroom[index] = tmp[2];
-	} else if (index == pixel_cpu_num) {
-		memcpy(sched_dvfs_headroom, tmp, sizeof(sched_dvfs_headroom));
+		memcpy(updated_tunables, tmp, sizeof(tmp));
 	} else {
 		goto fail;
 	}
@@ -1178,121 +1152,6 @@ static int update_teo_util_threshold(const char *buf, int count)
 		for (index = 0; index < pixel_cpu_num; index++) {
 			teo_cpu_set_util_threshold(index, tmp[index]);
 		}
-	} else {
-		goto fail;
-	}
-
-	kfree(str1);
-	return count;
-fail:
-	kfree(str1);
-	return -EINVAL;
-}
-
-static int update_sched_auto_uclamp_max(const char *buf, int count)
-{
-	char *tok, *str1, *str2;
-	unsigned int val, tmp[CONFIG_VH_SCHED_MAX_CPU_NR];
-	int index = 0;
-
-	str1 = kstrndup(buf, count, GFP_KERNEL);
-	str2 = str1;
-
-	if (!str2)
-		return -ENOMEM;
-
-	while (1) {
-		tok = strsep(&str2, " ");
-
-		if (tok == NULL)
-			break;
-
-		if (kstrtouint(tok, 0, &val))
-			goto fail;
-
-		if (val > SCHED_CAPACITY_SCALE)
-			goto fail;
-
-		tmp[index] = val;
-		index++;
-
-		if (index == pixel_cpu_num)
-			break;
-	}
-
-	if (index == 1) {
-		for (index = 0; index < pixel_cpu_num; index++) {
-			sched_auto_uclamp_max[index] = tmp[0];
-		}
-	} else if (index == pixel_cluster_num) {
-		for (index = pixel_cluster_start_cpu[0]; index < pixel_cluster_start_cpu[1]; index++)
-			sched_auto_uclamp_max[index] = tmp[0];
-
-		for (index = pixel_cluster_start_cpu[1]; index < pixel_cluster_start_cpu[2]; index++)
-			sched_auto_uclamp_max[index] = tmp[1];
-
-		for (index = pixel_cluster_start_cpu[2]; index < pixel_cpu_num; index++)
-			sched_auto_uclamp_max[index] = tmp[2];
-	} else if (index == pixel_cpu_num) {
-		memcpy(sched_auto_uclamp_max, tmp, sizeof(sched_auto_uclamp_max));
-	} else {
-		goto fail;
-	}
-
-	kfree(str1);
-	return count;
-fail:
-	kfree(str1);
-	return -EINVAL;
-}
-
-static int update_sched_per_cpu_iowait_boost_max_value(const char *buf, int count)
-{
-	char *tok, *str1, *str2;
-	unsigned int val, tmp[CONFIG_VH_SCHED_MAX_CPU_NR];
-	int index = 0;
-
-	str1 = kstrndup(buf, count, GFP_KERNEL);
-	str2 = str1;
-
-	if (!str2)
-		return -ENOMEM;
-
-	while (1) {
-		tok = strsep(&str2, " ");
-
-		if (tok == NULL)
-			break;
-
-		if (kstrtouint(tok, 0, &val))
-			goto fail;
-
-		if (val > SCHED_CAPACITY_SCALE)
-			goto fail;
-
-		tmp[index] = val;
-		index++;
-
-		if (index == pixel_cpu_num)
-			break;
-	}
-
-	if (index == 1) {
-		for (index = 0; index < pixel_cpu_num; index++) {
-			sched_per_cpu_iowait_boost_max_value[index] = tmp[0];
-		}
-	} else if (index == pixel_cluster_num) {
-		for (index = pixel_cluster_start_cpu[0]; index < pixel_cluster_start_cpu[1]; index++)
-			sched_per_cpu_iowait_boost_max_value[index] = tmp[0];
-
-		for (index = pixel_cluster_start_cpu[1]; index < pixel_cluster_start_cpu[2]; index++)
-			sched_per_cpu_iowait_boost_max_value[index] = tmp[1];
-
-		for (index = pixel_cluster_start_cpu[2]; index < pixel_cpu_num; index++)
-			sched_per_cpu_iowait_boost_max_value[index] = tmp[2];
-	} else if (index == pixel_cpu_num) {
-		memcpy(sched_per_cpu_iowait_boost_max_value, tmp,
-		       sizeof(sched_per_cpu_iowait_boost_max_value));
 	} else {
 		goto fail;
 	}
@@ -1433,22 +1292,20 @@ static int update_uclamp_fork_reset(const char *buf, bool val)
 	vp = get_vendor_task_struct(p);
 	rq = task_rq_lock(p, &rf);
 
-	if (task_on_rq_queued(p)) {
-		if (!get_uclamp_fork_reset(p, true) && val)
-			inc_adpf_counter(p, rq);
-		else if (get_uclamp_fork_reset(p, false) && !val)
-			dec_adpf_counter(p, rq);
-	}
-
 	if (vp->uclamp_fork_reset != val) {
-		/* force reset uclamp_fork_reset inheritance */
-		if (val)
-			vp->binder_task.uclamp_fork_reset = false;
+		bool old_uclamp_fork_reset = get_uclamp_fork_reset(p, true);
 
 		vp->uclamp_fork_reset = val;
 
 		if (vendor_sched_boost_adpf_prio)
 			update_adpf_prio(p, vp, val);
+
+		if (task_on_rq_queued(p)) {
+			if (old_uclamp_fork_reset && !get_uclamp_fork_reset(p, true))
+				dec_adpf_counter(p, task_rq(p));
+			else if (!old_uclamp_fork_reset && get_uclamp_fork_reset(p, true))
+				inc_adpf_counter(p, task_rq(p));
+		}
 	}
 
 	task_rq_unlock(rq, p, &rf);
@@ -1559,6 +1416,7 @@ SET_VENDOR_GROUP_STORE(rt, VG_RT);
 SET_VENDOR_GROUP_STORE(dex2oat, VG_DEX2OAT);
 SET_VENDOR_GROUP_STORE(ota, VG_OTA);
 SET_VENDOR_GROUP_STORE(sf, VG_SF);
+SET_VENDOR_GROUP_STORE(fg_wi, VG_FOREGROUND_WINDOW);
 
 // Create per-task attribute nodes
 PER_TASK_BOOL_ATTRIBUTE(prefer_idle);
@@ -1629,10 +1487,42 @@ static ssize_t util_threshold_store(struct file *filp,
 
 	buf[count] = '\0';
 
-	return update_sched_capacity_margin(buf, count);
+	return update_vendor_tunables(buf, count, SCHED_CAPACITY_MARGIN);
 }
 
 PROC_OPS_RW(util_threshold);
+
+static int thermal_cap_margin_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", thermal_cap_margin[i]);
+	}
+
+	seq_printf(m, "\n");
+
+	return 0;
+}
+
+static ssize_t thermal_cap_margin_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, THERMAL_CAP_MARGIN);
+}
+
+PROC_OPS_RW(thermal_cap_margin);
 
 static int dvfs_headroom_show(struct seq_file *m, void *v)
 {
@@ -1660,7 +1550,7 @@ static ssize_t dvfs_headroom_store(struct file *filp,
 
 	buf[count] = '\0';
 
-	return update_sched_dvfs_headroom(buf, count);
+	return update_vendor_tunables(buf, count, SCHED_DVFS_HEADROOM);
 }
 PROC_OPS_RW(dvfs_headroom);
 
@@ -2254,7 +2144,7 @@ static ssize_t auto_uclamp_max_store(struct file *filp,
 
 	buf[count] = '\0';
 
-	return update_sched_auto_uclamp_max(buf, count);
+	return update_vendor_tunables(buf, count, SCHED_AUTO_UCLAMP_MAX);
 }
 PROC_OPS_RW(auto_uclamp_max);
 
@@ -2377,7 +2267,7 @@ static ssize_t per_cpu_iowait_boost_max_value_store(struct file *filp,
 
 	buf[count] = '\0';
 
-	return update_sched_per_cpu_iowait_boost_max_value(buf, count);
+	return update_vendor_tunables(buf, count, SCHED_IOWAIT_BOOST_MAX);
 }
 PROC_OPS_RW(per_cpu_iowait_boost_max_value);
 
@@ -3105,6 +2995,72 @@ static ssize_t cpu_skip_mask_store(struct file *filp,
 }
 PROC_OPS_RW(cpu_skip_mask);
 
+int priority_task_name_show(struct seq_file *m, void *v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&priority_task_name_lock, flags);
+	seq_printf(m, "%s\n", priority_task_name);
+	spin_unlock_irqrestore(&priority_task_name_lock, flags);
+	return 0;
+}
+
+/*
+ * Accept multiple partial task names with comma separated
+ */
+ssize_t priority_task_name_store(struct file *filp, const char __user *ubuf, size_t count,
+				 loff_t *ppos)
+{
+	unsigned long flags;
+
+	if (count >= sizeof(priority_task_name))
+		return -EINVAL;
+
+	spin_lock_irqsave(&priority_task_name_lock, flags);
+
+	if (copy_from_user(priority_task_name, ubuf, count)) {
+		priority_task_name[0] = '\0';
+		spin_unlock_irqrestore(&priority_task_name_lock, flags);
+		return -EFAULT;
+	}
+
+	priority_task_name[count] = '\0';
+	spin_unlock_irqrestore(&priority_task_name_lock, flags);
+	return count;
+}
+PROC_OPS_RW(priority_task_name);
+
+static int priority_task_boost_value_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", vendor_sched_priority_task_boost_value);
+	return 0;
+}
+static ssize_t priority_task_boost_value_store(struct file *filp, const char __user *ubuf,
+					       size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > SCHED_CAPACITY_SCALE)
+		return -EINVAL;
+
+	vendor_sched_priority_task_boost_value = val;
+
+	return count;
+}
+PROC_OPS_RW(priority_task_boost_value);
+
 struct pentry {
 	const char *name;
 	enum vendor_procfs_type type;
@@ -3128,6 +3084,7 @@ static struct pentry entries[] = {
 	PROC_GROUP_ENTRIES(dex2oat, VG_DEX2OAT),
 	PROC_GROUP_ENTRIES(ota, VG_OTA),
 	PROC_GROUP_ENTRIES(sf, VG_SF),
+	PROC_GROUP_ENTRIES(fg_wi, VG_FOREGROUND_WINDOW),
 #if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
 	// FG util group attributes
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
@@ -3151,6 +3108,7 @@ static struct pentry entries[] = {
 	PROC_ENTRY(reset_uclamp_stats),
 #endif
 	PROC_ENTRY(util_threshold),
+	PROC_ENTRY(thermal_cap_margin),
 	PROC_ENTRY(util_post_init_scale),
 	PROC_ENTRY(npi_packing),
 	PROC_ENTRY(reduce_prefer_idle),
@@ -3216,6 +3174,10 @@ static struct pentry entries[] = {
 	PROC_ENTRY(cpu_skip_mask),
 	// skip mask for prefer prev cpu
 	PROC_ENTRY(skip_prefer_prev_mask),
+	// names for the priority task
+	PROC_ENTRY(priority_task_name),
+	// boost value for the priority task
+	PROC_ENTRY(priority_task_boost_value),
 };
 
 

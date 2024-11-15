@@ -70,8 +70,6 @@ obj-y += drivers/performance/lat_governors/
 
 obj-y += drivers/iio/
 
-obj-y += drivers/staging/android/
-
 obj-y += drivers/bts/
 
 obj-y += drivers/block/zram/

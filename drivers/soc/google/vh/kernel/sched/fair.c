@@ -49,6 +49,7 @@ extern struct cpumask skip_prefer_prev_mask;
 
 static unsigned int early_boot_boost_uclamp_min = 563;
 module_param(early_boot_boost_uclamp_min, uint, 0644);
+static struct mutex thermal_cap_mutex;
 
 unsigned int sched_auto_fits_capacity[CONFIG_VH_SCHED_MAX_CPU_NR];
 unsigned int sched_capacity_margin[CONFIG_VH_SCHED_MAX_CPU_NR] =
@@ -57,7 +58,14 @@ unsigned int sched_dvfs_headroom[CONFIG_VH_SCHED_MAX_CPU_NR] =
 	{ [0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1] = DEF_UTIL_THRESHOLD };
 
 unsigned int sched_auto_uclamp_max[CONFIG_VH_SCHED_MAX_CPU_NR] =
-	{ [0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1] = 1024 };
+	{ [0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1] = SCHED_CAPACITY_SCALE };
+
+unsigned int thermal_cap_margin[CONFIG_VH_SCHED_MAX_CPU_NR] =
+	{ [0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1] = DEF_THERMAL_CAP_MARGIN };
+
+struct thermal_cap thermal_cap[CONFIG_VH_SCHED_MAX_CPU_NR] = {
+	[0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1].uclamp_max = SCHED_CAPACITY_SCALE,
+	[0 ... CONFIG_VH_SCHED_MAX_CPU_NR - 1].freq = UINT_MAX};
 
 unsigned int __read_mostly sched_per_task_iowait_boost_max_value = 0;
 
@@ -89,7 +97,6 @@ extern void rvh_uclamp_eff_get_pixel_mod(void *data, struct task_struct *p, enum
  * Any change for these functions in upstream GKI would require extensive review
  * to make proper adjustment in vendor hook.
  */
-#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
 
 #define for_each_clamp_id(clamp_id) \
 	for ((clamp_id) = 0; (clamp_id) < UCLAMP_CNT; (clamp_id)++)
@@ -669,6 +676,7 @@ void init_pixel_em(void)
 #if IS_ENABLED(CONFIG_PIXEL_EM)
 	raw_spin_lock_init(&vendor_sched_pixel_em_lock);
 #endif
+	mutex_init(&thermal_cap_mutex);
 }
 
 #if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
@@ -1583,7 +1591,7 @@ int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	struct cpuidle_state *idle_state;
 	unsigned long unimportant_max_spare_cap = 0, idle_max_cap = 0;
 	unsigned long cfs_load, min_load = ULONG_MAX;
-	bool prefer_fit;
+	bool prefer_fit = false;
 	const cpumask_t *preferred_idle_mask;
 
 	rd = cpu_rq(this_cpu)->rd;
@@ -2014,7 +2022,7 @@ int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 
 out:
 	rcu_read_unlock();
-	trace_sched_find_energy_efficient_cpu(p, prefer_idle, get_prefer_high_cap(p),
+	trace_sched_find_energy_efficient_cpu(p, prefer_idle, prefer_fit,
 					 task_importance, &idle_fit, &idle_unfit, &unimportant_fit,
 					 &unimportant_unfit, &packing, &max_spare_cap, &idle_unpreferred,
 					 best_energy_cpu);
@@ -2117,12 +2125,14 @@ uclamp_tg_restrict_pixel_mod(struct task_struct *p, enum uclamp_id clamp_id)
 {
 	struct uclamp_se uc_req = p->uclamp_req[clamp_id];
 	struct vendor_task_struct *vp = get_vendor_task_struct(p);
-	struct vendor_binder_task_struct *vbinder = get_vendor_binder_task_struct(p);
+	struct vendor_inheritance_struct *vi = get_vendor_inheritance_struct(p);
 	bool is_adpf = get_uclamp_fork_reset(p, true);
+	int i = 0;
 
 #if IS_ENABLED(CONFIG_UCLAMP_TASK_GROUP)
 	unsigned int tg_min, tg_max, vnd_min, vnd_max, value;
 	unsigned int nice_min = uclamp_none(UCLAMP_MIN), nice_max = uclamp_none(UCLAMP_MAX);
+	unsigned int thermal_uclamp_max = thermal_cap[task_cpu(p)].uclamp_max;
 
 	// Task prio specific restriction
 	get_uclamp_on_nice(p, UCLAMP_MIN, &nice_min);
@@ -2156,12 +2166,9 @@ uclamp_tg_restrict_pixel_mod(struct task_struct *p, enum uclamp_id clamp_id)
 	value = clamp(value, max(nice_min, max(tg_min, vnd_min)),
 		      min(nice_max, min(tg_max, vnd_max)));
 
-	// RT_mutex inherited uclamp restriction
-	value = clamp(value, vp->uclamp_pi[UCLAMP_MIN], vp->uclamp_pi[UCLAMP_MAX]);
-
-	// Inherited uclamp restriction
-	if (vbinder->active)
-		value = clamp(value, vbinder->uclamp[UCLAMP_MIN], vbinder->uclamp[UCLAMP_MAX]);
+	// inherited uclamp restriction
+	for (; i < VI_MAX; i++)
+		value = clamp(value, vi->uclamp[i][UCLAMP_MIN], vi->uclamp[i][UCLAMP_MAX]);
 
 	// prefer high capacity cpu
 	if (clamp_id == UCLAMP_MIN && get_prefer_high_cap(p))
@@ -2173,6 +2180,15 @@ uclamp_tg_restrict_pixel_mod(struct task_struct *p, enum uclamp_id clamp_id)
 	if (clamp_id == UCLAMP_MIN && uc_req.value <= max(tg_min, vnd_min) && uc_req.user_defined
 		&& value < SCHED_CAPACITY_SCALE)
 		value = value + 1;
+
+	if (clamp_id == UCLAMP_MAX && thermal_uclamp_max != SCHED_CAPACITY_SCALE) {
+		if (!is_adpf)
+			value = min(value, thermal_uclamp_max);
+		else {
+			value = min(value, min_t(unsigned int, SCHED_CAPACITY_SCALE, thermal_uclamp_max *
+				thermal_cap_margin[task_cpu(p)] >> SCHED_CAPACITY_SHIFT));
+		}
+	}
 
 	// For low prio unthrottled task, reduce its uclamp.max by 1 which
 	// would affect task importance in cpu_rq thus affect task placement.
@@ -2581,6 +2597,7 @@ out:
 	if (trace_sched_select_task_rq_fair_enabled())
 		trace_sched_select_task_rq_fair(p, task_util_est(p),
 						sync_wakeup, prefer_prev,
+						get_uclamp_fork_reset(p, true),
 						get_prefer_high_cap(p),
 						get_vendor_group(p),
 						uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
@@ -3021,3 +3038,103 @@ void vh_sched_resume_end(void *data, void *unused)
 	sysctl_sched_wakeup_granularity = vh_sched_wakeup_granularity_ns;
 	sysctl_sched_latency = vh_sched_latency_ns;
 }
+
+static int find_target_cap(unsigned int freq, unsigned int cpu)
+{
+	struct pixel_em_profile **profile_ptr_snapshot, *profile;
+	struct pixel_em_cluster *em_cluster;
+	struct task_struct *g, *p;
+	int target_cap = 0, i;
+
+	profile_ptr_snapshot = READ_ONCE(vendor_sched_pixel_em_profile);
+	if (!profile_ptr_snapshot) {
+		pr_err("Pixel EM profile not found\n");
+		return -EINVAL;
+	}
+
+	profile = READ_ONCE(*profile_ptr_snapshot);
+	if (!profile) {
+		pr_err("Pixel EM profile not found\n");
+		return -EINVAL;
+	}
+
+	em_cluster = profile->cpu_to_cluster[cpu];
+
+	if (freq >= em_cluster->opps[em_cluster->num_opps - 1].freq)
+		target_cap = SCHED_CAPACITY_SCALE;
+	else {
+		for (i = 0; i < em_cluster->num_opps; i++) {
+			struct pixel_em_opp *opp = &em_cluster->opps[i];
+			if (opp->freq >= freq) {
+				/* use -3 to make sure the various conversion logic
+				* which can end up rounding up or down by 1
+				* doesn't lead to wrong results.
+				*/
+				target_cap =  opp->capacity - 3;
+				break;
+			}
+		}
+	}
+
+	if (target_cap <= 0)
+		return -EINVAL;
+
+	for_each_cpu(cpu, &em_cluster->cpus) {
+		pr_debug("updating CPU:%d uclamp value to :%u freq value to:%u \n",
+			cpu, target_cap, freq);
+		thermal_cap[cpu].uclamp_max = target_cap;
+		thermal_cap[cpu].freq = freq;
+	}
+
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		if (!task_on_rq_queued(p))
+			continue;
+
+		if (!cpumask_test_cpu(task_cpu(p), &em_cluster->cpus))
+			continue;
+
+		uclamp_update_active(p, UCLAMP_MAX);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+/**
+ * sched_thermal_freq_cap() - Thermal cooling device will use this API
+ * to place a max frequency cap for a cluster. Ideally the first CPU in that cluster will
+ * be given as input. Thermal will expect the freq cap be applied to all CPUs in
+ * that cluster.
+ *
+ * @cpu - Any cpu that belongs to a cluster.
+ * @freq - CPU frequency cap that needs to be applied to all CPUs in that cluster.
+ * Return: 0 on success or error value.
+ */
+int sched_thermal_freq_cap(unsigned int cpu, unsigned int freq)
+{
+	int ret;
+
+	mutex_lock(&thermal_cap_mutex);
+	ret = find_target_cap(freq, cpu);
+	mutex_unlock(&thermal_cap_mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sched_thermal_freq_cap);
+
+/**
+ * update_thermal_freq_cap() - pixel_em will use this API to update thermal cap (ulcamp min)
+ * and keep original capped max frequency.
+ * @cpu - Any cpu whose energy model will be changed by pixel_em.
+ */
+void update_thermal_freq_cap(unsigned int cpu)
+{
+	if (cpu >= nr_cpu_ids)
+		return;
+
+	mutex_lock(&thermal_cap_mutex);
+	WARN_ON(!find_target_cap(thermal_cap[cpu].freq, cpu));
+	mutex_unlock(&thermal_cap_mutex);
+}
+EXPORT_SYMBOL_GPL(update_thermal_freq_cap);
